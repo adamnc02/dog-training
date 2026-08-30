@@ -1293,21 +1293,24 @@ function anyKey(family, phase){
   throw new Error(`anyKey: unknown family "${family}"`);
 }
 /* ============================================================
-   PLAN IMPORT  (schema v2 — day-keyed)
+   PLAN IMPORT  (schema v3 — day-keyed, with exercise combos)
    Applies a trainer-authored plan (STATE.planImport, produced by the
    separate Trainer Planner app) on top of the default program. Runs
    every render, right after applyExtensions() rebuilds PHASES[*].days
    from the frozen defaults — so this always starts from a clean slate
    and only touches what's actually overridden.
 
-   Shape: { v:2, phases:{ [phaseId]: {playPhase, placePhase} },
+   Shape: { v:3, phases:{ [phaseId]: {playPhase, placePhase} },
             days:{ [dayNumber]: {pre, morning, afternoon, evening, post, locations} } }
    dayNumber is the default (unextended) 1–49 numbering used across
-   the whole main journey. pre/post apply to all three of that day's
-   sessions uniformly when present; morning/afternoon/evening each
-   replace that session's training exercises; locations overrides
-   sessionLocations for that day. Anything not covered by the import
-   falls back to the default program untouched.
+   the whole main journey. pre/post are flat lists of refs, each
+   rendered as its own line (matching how Golden/house rules always
+   worked). morning/afternoon/evening are each a list of GROUPS —
+   every group is itself a list of one-or-more refs, and everything
+   inside one group renders combined on a single line ("Redirect &
+   Loose Lead Walking"); separate groups render as separate lines.
+   locations overrides sessionLocations for that day. Anything not
+   covered by the import falls back to the default program untouched.
    ============================================================ */
 function applyPlanOverrides(){
   MAIN_PHASE_ORDER.forEach(pid=>{
@@ -1334,13 +1337,20 @@ function applyPlanOverrides(){
         if(!ov) return;
         ['morning','afternoon','evening'].forEach(sk=>{
           if(!ov[sk] || !d.sessions || !d.sessions[sk]) return;
-          const trainingComp = { type:'training', ex: ov[sk].map(([f,p])=>libKey(f,p)) };
-          let replaced = false;
-          d.sessions[sk] = d.sessions[sk].map(c=>{
-            if(c.type==='training' && !replaced){ replaced = true; return trainingComp; }
-            return c;
+          const newTrainingComps = ov[sk].map(group=>({ type:'training', ex: group.map(([f,p])=>libKey(f,p)) }));
+          let inserted = false;
+          const rebuilt = [];
+          d.sessions[sk].forEach(c=>{
+            if(c.type==='training'){
+              if(!inserted){ rebuilt.push(...newTrainingComps); inserted = true; }
+              // drop any further default training components — a single
+              // slot only ever has one by default, but this stays safe either way
+            } else {
+              rebuilt.push(c);
+            }
           });
-          if(!replaced) d.sessions[sk] = [...d.sessions[sk], trainingComp];
+          if(!inserted) rebuilt.push(...newTrainingComps);
+          d.sessions[sk] = rebuilt;
         });
         if(ov.locations){
           d.sessionLocations = Object.assign({}, d.sessionLocations, ov.locations);
@@ -1370,7 +1380,7 @@ function applyPlanOverrides(){
 function decodeAndValidatePlan(raw){
   const json = decodeURIComponent(escape(atob(raw)));
   const plan = JSON.parse(json);
-  if(!plan || typeof plan !== 'object' || plan.v !== 2) throw new Error('unsupported plan version');
+  if(!plan || typeof plan !== 'object' || plan.v !== 3) throw new Error('unsupported plan version');
   if(plan.phases){
     Object.keys(plan.phases).forEach(pid=>{
       if(!PHASES[pid]) throw new Error(`unknown phase "${pid}"`);
@@ -1381,7 +1391,7 @@ function decodeAndValidatePlan(raw){
   }
   if(plan.days){
     Object.values(plan.days).forEach(dayOv=>{
-      ['morning','afternoon','evening'].forEach(sk=>{ (dayOv[sk]||[]).forEach(([f,p])=>libKey(f,p)); });
+      ['morning','afternoon','evening'].forEach(sk=>{ (dayOv[sk]||[]).forEach(group=>group.forEach(([f,p])=>libKey(f,p))); });
       (dayOv.pre||[]).forEach(([f,p])=>anyKey(f,p));
       (dayOv.post||[]).forEach(([f,p])=>anyKey(f,p));
     });
@@ -2542,7 +2552,7 @@ document.addEventListener('click', function(e){
         STATE.locationAssignments = {};
         LOCATIONS.forEach(loc=>{ STATE.locationAssignments[loc.id] = loc.name; });
         STATE.completedCount = computeAutoCompletedCount(STATE.startDate, STATE.handFeedingAlreadyDone, STATE.newtonsCradleAlreadyDone);
-        STATE.planImport = { v:2, phases: plan.phases||{}, days: plan.days||{} };
+        STATE.planImport = { v:3, phases: plan.phases||{}, days: plan.days||{} };
         STATE.onboarded = true;
         STATE.ui.planImportField = '';
         STATE.ui.view = 'locationSetup';
@@ -2696,7 +2706,7 @@ document.addEventListener('click', function(e){
         const plan = decodeAndValidatePlan(raw);
         // Settings-screen updates only ever touch exercises/rules/locations —
         // dog details and start date are set once, at initial import.
-        STATE.planImport = { v:2, phases: plan.phases||{}, days: plan.days||{} };
+        STATE.planImport = { v:3, phases: plan.phases||{}, days: plan.days||{} };
         STATE.ui.planImportField = '';
         saveState();
         toast('Trainer plan applied.');
