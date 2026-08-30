@@ -1067,6 +1067,11 @@ const SESSION_RULES_OVERRIDES = {};
    applying any per-day override, then layering in the dynamic
    threshold-manners introduction on top of whatever pre[] it finds. */
 function sessionRuleItems(phaseId, day, sessionKey, slot){
+  const plan = STATE.planImport;
+  const dayOv = plan && plan.days && plan.days[day];
+  if(dayOv && dayOv[slot] !== undefined){
+    return dayOv[slot].map(([f,p])=>anyKey(f,p));
+  }
   const override = SESSION_RULES_OVERRIDES[phaseId] && SESSION_RULES_OVERRIDES[phaseId][day] && SESSION_RULES_OVERRIDES[phaseId][day][sessionKey];
   const cfg = SESSION_RULES_LIBRARY[phaseId] && SESSION_RULES_LIBRARY[phaseId][sessionKey];
   const base = (override && override[slot]) ? override[slot].slice() : ((cfg && cfg[slot]) ? cfg[slot].slice() : []);
@@ -1241,6 +1246,11 @@ const MAIN_PHASE_ORDER = ['week1','weeks2-3','weeks4-5','weeks6-7'];
    ============================================================ */
 const BASE_PHASE_DAYS = {};
 Object.keys(PHASES).forEach(pid=>{ BASE_PHASE_DAYS[pid] = JSON.parse(JSON.stringify(PHASES[pid].days)); });
+/* Frozen snapshot of each main phase's default Play/Place phase keys,
+   captured before any plan import can touch them — the "reset point"
+   applyPlanOverrides() falls back to when there's no override. */
+const DEFAULT_PLAY_KEY = {}, DEFAULT_PLACE_KEY = {};
+MAIN_PHASE_ORDER.forEach(pid=>{ DEFAULT_PLAY_KEY[pid]=PHASES[pid].playKey; DEFAULT_PLACE_KEY[pid]=PHASES[pid].placeKey; });
 
 function computeExtendedDays(phaseId){
   const base = BASE_PHASE_DAYS[phaseId];
@@ -1273,6 +1283,112 @@ function applyExtensions(){
   });
 }
 function phaseWeekCount(phaseId){ return Math.ceil(PHASES[phaseId].days.length/7); }
+/* Resolve a (family, phase) pair whether it names an EXERCISE_LIBRARY
+   family or a RULE_LIBRARY family — used for plan-import overrides,
+   which can reference either kind of item. The two libraries never
+   share a family name. */
+function anyKey(family, phase){
+  if(EXERCISE_LIBRARY[family]) return libKey(family, phase);
+  if(RULE_LIBRARY[family]) return ruleKey(family, phase);
+  throw new Error(`anyKey: unknown family "${family}"`);
+}
+/* ============================================================
+   PLAN IMPORT  (schema v2 — day-keyed)
+   Applies a trainer-authored plan (STATE.planImport, produced by the
+   separate Trainer Planner app) on top of the default program. Runs
+   every render, right after applyExtensions() rebuilds PHASES[*].days
+   from the frozen defaults — so this always starts from a clean slate
+   and only touches what's actually overridden.
+
+   Shape: { v:2, phases:{ [phaseId]: {playPhase, placePhase} },
+            days:{ [dayNumber]: {pre, morning, afternoon, evening, post, locations} } }
+   dayNumber is the default (unextended) 1–49 numbering used across
+   the whole main journey. pre/post apply to all three of that day's
+   sessions uniformly when present; morning/afternoon/evening each
+   replace that session's training exercises; locations overrides
+   sessionLocations for that day. Anything not covered by the import
+   falls back to the default program untouched.
+   ============================================================ */
+function applyPlanOverrides(){
+  MAIN_PHASE_ORDER.forEach(pid=>{
+    PHASES[pid].playKey = DEFAULT_PLAY_KEY[pid];
+    PHASES[pid].placeKey = DEFAULT_PLACE_KEY[pid];
+  });
+  const plan = STATE.planImport;
+  if(!plan) return;
+
+  if(plan.phases){
+    MAIN_PHASE_ORDER.forEach(pid=>{
+      const ov = plan.phases[pid];
+      if(!ov) return;
+      const phase = PHASES[pid];
+      if(ov.playPhase) phase.playKey = libKey('play', ov.playPhase);
+      if(ov.placePhase) phase.placeKey = libKey('place', ov.placePhase);
+    });
+  }
+
+  if(plan.days){
+    MAIN_PHASE_ORDER.forEach(pid=>{
+      PHASES[pid].days.forEach(d=>{
+        const ov = plan.days[d.day];
+        if(!ov) return;
+        ['morning','afternoon','evening'].forEach(sk=>{
+          if(!ov[sk] || !d.sessions || !d.sessions[sk]) return;
+          const trainingComp = { type:'training', ex: ov[sk].map(([f,p])=>libKey(f,p)) };
+          let replaced = false;
+          d.sessions[sk] = d.sessions[sk].map(c=>{
+            if(c.type==='training' && !replaced){ replaced = true; return trainingComp; }
+            return c;
+          });
+          if(!replaced) d.sessions[sk] = [...d.sessions[sk], trainingComp];
+        });
+        if(ov.locations){
+          d.sessionLocations = Object.assign({}, d.sessionLocations, ov.locations);
+          d.location = d.sessionLocations.morning;
+        }
+      });
+    });
+  }
+
+  // Recompute each main phase's exercise carousel to reflect training overrides
+  MAIN_PHASE_ORDER.forEach(pid=>{
+    const phase = PHASES[pid];
+    const keys = new Set([phase.playKey, phase.placeKey]);
+    if(phase.dailyTaskKey) keys.add(phase.dailyTaskKey);
+    phase.days.forEach(d=>{
+      Object.values(d.sessions||{}).forEach(comps=>{
+        comps.forEach(c=>{ if(c.type==='training') c.ex.forEach(k=>keys.add(k)); });
+      });
+    });
+    phase.exerciseKeys = [...keys];
+  });
+}
+/* Decodes and validates a base64 plan code, throwing a descriptive
+   error if it's not readable or references an unknown family/phase.
+   Shared by both import entry points (Welcome-screen full import and
+   Settings plan-code import). */
+function decodeAndValidatePlan(raw){
+  const json = decodeURIComponent(escape(atob(raw)));
+  const plan = JSON.parse(json);
+  if(!plan || typeof plan !== 'object' || plan.v !== 2) throw new Error('unsupported plan version');
+  if(plan.phases){
+    Object.keys(plan.phases).forEach(pid=>{
+      if(!PHASES[pid]) throw new Error(`unknown phase "${pid}"`);
+      const ov = plan.phases[pid];
+      if(ov.playPhase) libKey('play', ov.playPhase);
+      if(ov.placePhase) libKey('place', ov.placePhase);
+    });
+  }
+  if(plan.days){
+    Object.values(plan.days).forEach(dayOv=>{
+      ['morning','afternoon','evening'].forEach(sk=>{ (dayOv[sk]||[]).forEach(([f,p])=>libKey(f,p)); });
+      (dayOv.pre||[]).forEach(([f,p])=>anyKey(f,p));
+      (dayOv.post||[]).forEach(([f,p])=>anyKey(f,p));
+    });
+  }
+  return plan;
+}
+
 /* Extending is only safe while the phase isn't complete yet: the new
    week is always appended right after the phase's current last day,
    and completedCount (a raw index into the flat day sequence) only
@@ -1307,8 +1423,9 @@ function defaultState(){
     locationAssignments:{}, // {locationId: chosenLabel}
     completedCount:0, // global index into ALL_DAYS sequence
     extensions:{}, // {phaseId: number of extra 1-week blocks appended}
+    planImport:null, // decoded trainer-provided plan override object, or null for the default program
     settings:{ dateGateEnabled:true },
-    ui:{ view:'journey', weekId:null, openDays:{}, exCarouselIndex:{}, modal:null, modalTab:'rules', settingsEditingLocations:false, devUnlocked:false, devPasswordField:'', checkinData:null, pendingDayAction:null },
+    ui:{ view:'journey', weekId:null, openDays:{}, exCarouselIndex:{}, modal:null, modalTab:'rules', settingsEditingLocations:false, devUnlocked:false, devPasswordField:'', checkinData:null, pendingDayAction:null, planImportField:'' },
   };
 }
 let STATE = loadState();
@@ -1607,6 +1724,7 @@ function renderOnboarding(){
   const key = STATE.ui.obStep || 'welcome';
   const draft = STATE.onboardingDraft;
   if(key==='welcome') return obWelcome();
+  if(key==='import') return obImportPlan();
   if(key==='handfeeding') return obHandFeeding();
   if(key==='newtonscradle') return obNewtonsCradle();
   if(key==='dogname') return obDogName();
@@ -1623,7 +1741,22 @@ function obWelcome(){
       <p>Hand Feeding, Newton's Cradle, and a 49-day main journey — one day unlocks at a time, with the How and the Why for every exercise along the way.</p>
     </div>
     <div class="onboard-actions">
-      <button class="btn btn-primary btn-block" data-action="ob-start">Begin setup</button>
+      <button class="btn btn-primary btn-block" data-action="ob-goto-import">Import your trainer's plan</button>
+      <button class="btn btn-ghost btn-block" data-action="ob-start" style="margin-top:8px;">Set up without a trainer</button>
+    </div>
+  </div>`;
+}
+function obImportPlan(){
+  return `<div class="onboard-screen">
+    <div class="step-eyebrow">Trainer plan</div>
+    <h2 class="step-q">Paste your plan code</h2>
+    <p class="step-sub">Your trainer will have sent you a code from their planner. Paste it below — it sets up your dog's details, start date, and personalized plan in one go.</p>
+    <div class="field" style="margin-bottom:14px;">
+      <textarea rows="4" placeholder="Paste your plan code here" data-action="ob-import-input" style="width:100%; font-family:monospace; font-size:12px;">${esc(STATE.ui.planImportField||'')}</textarea>
+    </div>
+    <div class="onboard-footer">
+      <button class="btn btn-ghost" data-action="ob-back">Back</button>
+      <button class="btn btn-primary" data-action="apply-full-plan-import">Import plan</button>
     </div>
   </div>`;
 }
@@ -1727,6 +1860,31 @@ function obLocations(){
     <div class="onboard-footer">
       <button class="btn btn-ghost" data-action="ob-back">Back</button>
       <button class="btn btn-primary" data-action="ob-continue" data-from="locations">Continue</button>
+    </div>
+  </div>`;
+}
+/* Post-import location setup — reached only right after a trainer plan
+   is imported from the Welcome screen. Operates directly on
+   STATE.locationAssignments (already onboarded at this point), unlike
+   obLocations() which writes into the onboarding draft. Skippable —
+   defaults are already filled in from the LOCATIONS catalog. */
+function renderLocationSetup(){
+  const items = LOCATIONS.map(loc=>{
+    const val = STATE.locationAssignments[loc.id] || loc.name;
+    return `<div class="loc-setup-item">
+      <div class="idx">LOCATION ${loc.id} OF 20</div>
+      <div class="desc">${esc(loc.desc.replace(/\{\{dog_name\}\}/g,STATE.dogName||'your dog'))}</div>
+      <input type="text" value="${esc(val)}" placeholder="${esc(loc.name)}" data-action="settings-loc-input" data-locid="${loc.id}">
+    </div><hr class="divider">`;
+  }).join('');
+  return `<div class="onboard-screen">
+    <div class="step-eyebrow">Your 20 locations</div>
+    <h2 class="step-q">Where will each stage happen?</h2>
+    <p class="step-sub">Your trainer has already set up ${esc(STATE.dogName||'your dog')}'s plan. Match each fixed slot to a real place near you — you can skip this and fill it in later from Settings.</p>
+    ${items}
+    <div class="onboard-footer">
+      <button class="btn btn-ghost" data-action="location-setup-skip">Skip for now</button>
+      <button class="btn btn-primary" data-action="location-setup-continue">Continue</button>
     </div>
   </div>`;
 }
@@ -2132,6 +2290,18 @@ function renderSettings(){
       </div>
       <input type="file" id="restore-file-input" accept="application/json,.json" style="display:none;">
     </div>
+    <hr class="divider">
+    <div class="settings-section">
+      <h3>Trainer plan</h3>
+      <p class="faint" style="margin:-4px 0 14px;">${s.planImport ? 'A custom plan from your trainer is active. It overrides the default program\u2019s exercises, house rules, and/or locations wherever your trainer chose to change them.' : 'If your trainer sent you a plan code, paste it below to personalize your program.'}</p>
+      <div class="field" style="margin-bottom:10px;">
+        <textarea rows="3" placeholder="Paste your trainer's plan code here" data-action="plan-import-input" style="width:100%; font-family:monospace; font-size:12px;">${esc(STATE.ui.planImportField||'')}</textarea>
+      </div>
+      <div class="setting-row">
+        <button class="btn btn-plain btn-sm" data-action="apply-plan-import">Apply plan code</button>
+        ${s.planImport ? '<button class="btn btn-plain btn-sm" data-action="clear-plan-import">Revert to default plan</button>' : ''}
+      </div>
+    </div>
     ${renderDevSection()}
     <hr class="divider">
     <div class="settings-section">
@@ -2236,10 +2406,13 @@ function restoreBackupFromFile(file){
    ============================================================ */
 function render(){
   applyExtensions();
+  applyPlanOverrides();
   const app = document.getElementById('app');
   let html;
   if(!STATE.onboarded){
     html = renderOnboarding();
+  } else if(STATE.ui.view==='locationSetup'){
+    html = renderLocationSetup();
   } else if(STATE.ui.view==='settings'){
     html = renderSettings();
   } else if(STATE.ui.view==='week' && STATE.ui.weekId){
@@ -2353,6 +2526,35 @@ document.addEventListener('click', function(e){
 
   switch(action){
     case 'ob-start': goObStep('handfeeding'); STATE.ui._obHistory=['welcome']; render(); break;
+    case 'ob-goto-import': goObStep('import'); STATE.ui._obHistory=['welcome']; render(); break;
+    case 'apply-full-plan-import': {
+      const raw = (STATE.ui.planImportField||'').trim();
+      if(!raw){ toast('Paste your plan code first.'); break; }
+      try{
+        const plan = decodeAndValidatePlan(raw);
+        if(!plan.onboarding) throw new Error('missing onboarding details');
+        const ob = plan.onboarding;
+        STATE.dogName = (ob.dogName||'').trim() || 'Your dog';
+        STATE.dogGender = ob.dogGender==='female' ? 'female' : 'male';
+        STATE.handFeedingAlreadyDone = !!ob.handFeedingAlreadyDone;
+        STATE.newtonsCradleAlreadyDone = STATE.handFeedingAlreadyDone ? !!ob.newtonsCradleAlreadyDone : false;
+        STATE.startDate = ob.startDate || lastMondayISO();
+        STATE.locationAssignments = {};
+        LOCATIONS.forEach(loc=>{ STATE.locationAssignments[loc.id] = loc.name; });
+        STATE.completedCount = computeAutoCompletedCount(STATE.startDate, STATE.handFeedingAlreadyDone, STATE.newtonsCradleAlreadyDone);
+        STATE.planImport = { v:2, phases: plan.phases||{}, days: plan.days||{} };
+        STATE.onboarded = true;
+        STATE.ui.planImportField = '';
+        STATE.ui.view = 'locationSetup';
+        saveState();
+        toast('Plan imported \u2014 welcome, '+STATE.dogName+'!');
+      }catch(e){
+        toast('That plan code couldn\u2019t be read \u2014 double check it was copied in full.');
+      }
+      render(); break;
+    }
+    case 'location-setup-skip': STATE.ui.view='journey'; saveState(); render(); break;
+    case 'location-setup-continue': STATE.ui.view='journey'; saveState(); render(); break;
     case 'ob-set': {
       const field = t.dataset.field; let val = t.dataset.value;
       if(val==='true') val=true; else if(val==='false') val=false;
@@ -2487,6 +2689,28 @@ document.addEventListener('click', function(e){
       if(input) input.click();
       break;
     }
+    case 'apply-plan-import': {
+      const raw = (STATE.ui.planImportField||'').trim();
+      if(!raw){ toast('Paste a plan code first.'); break; }
+      try{
+        const plan = decodeAndValidatePlan(raw);
+        // Settings-screen updates only ever touch exercises/rules/locations —
+        // dog details and start date are set once, at initial import.
+        STATE.planImport = { v:2, phases: plan.phases||{}, days: plan.days||{} };
+        STATE.ui.planImportField = '';
+        saveState();
+        toast('Trainer plan applied.');
+      }catch(e){
+        toast('That plan code couldn\u2019t be read \u2014 double check it was copied in full.');
+      }
+      render(); break;
+    }
+    case 'clear-plan-import': {
+      STATE.planImport = null;
+      saveState();
+      toast('Reverted to the default plan.');
+      render(); break;
+    }
     case 'open-restart-date': STATE.ui.modal='restart-date'; render(); break;
     case 'set-startdate': {
       STATE.startDate = t.dataset.value;
@@ -2523,6 +2747,10 @@ document.addEventListener('input', function(e){
     saveState();
   } else if(action==='dev-password-input'){
     STATE.ui.devPasswordField = el.value;
+  } else if(action==='plan-import-input'){
+    STATE.ui.planImportField = el.value;
+  } else if(action==='ob-import-input'){
+    STATE.ui.planImportField = el.value;
   }
 }, false);
 
