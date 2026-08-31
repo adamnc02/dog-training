@@ -1308,7 +1308,8 @@ function anyKey(family, phase){
    Shape: { v:5, days:{ [dayNumber]: {
               morning:{training,pre,post}, afternoon:{...}, evening:{...},
               locations
-            } } }
+            } },
+            checkins:{ [dayNumber]: { title, items:[{label,detail}] } } }
    dayNumber is the default (unextended) 1–49 numbering used across
    the whole main journey. Each session has its OWN pre/post — pre/post
    are flat lists of refs (each rendered as its own line, matching how
@@ -1320,8 +1321,11 @@ function anyKey(family, phase){
    EXERCISE_LIBRARY) — nothing forces them into a session; they only
    appear where a group's refs actually include them, same as any
    other exercise. locations overrides sessionLocations for that day.
-   Anything not covered by the import falls back to the default
-   program untouched.
+   checkins[dayNumber] fully replaces the default check-in title and
+   items for that week-end (see checkinForCompletedDay() below) — it's
+   read directly at render time, not merged into PHASES[*].days like
+   the rest of the plan. Anything not covered by the import falls back
+   to the default program untouched.
    ============================================================ */
 function applyPlanOverrides(){
   const plan = STATE.planImport;
@@ -1387,6 +1391,14 @@ function decodeAndValidatePlan(raw){
         (sessOv.training||[]).forEach(group=>group.forEach(([f,p])=>libKey(f,p)));
         (sessOv.pre||[]).forEach(([f,p])=>anyKey(f,p));
         (sessOv.post||[]).forEach(([f,p])=>anyKey(f,p));
+      });
+    });
+  }
+  if(plan.checkins){
+    Object.values(plan.checkins).forEach(ci=>{
+      if(!ci || typeof ci.title !== 'string' || !Array.isArray(ci.items)) throw new Error('malformed check-in override');
+      ci.items.forEach(it=>{
+        if(typeof it.label !== 'string' || typeof it.detail !== 'string') throw new Error('malformed check-in item');
       });
     });
   }
@@ -1534,7 +1546,13 @@ function getExerciseKeysForPhase(phaseId){
   return keys;
 }
 /* Check-in: fires at the end of every real calendar week of the main plan (days 7/14/21/28/35/42/49),
-   and at the end of Newton's Cradle (day 7 of that phase). Never after Hand Feeding. */
+   and at the end of Newton's Cradle (day 7 of that phase). Never after Hand Feeding.
+   A trainer-authored override (STATE.planImport.checkins[day], produced by the
+   separate Trainer Planner app) fully replaces the default title + items for
+   that day when present — nothing merges field-by-field. Only main-phase
+   week-ends can be overridden this way; the Planner doesn't currently offer
+   a way to customise the Newton's Cradle (prePhaseB) check-in below, so that
+   one always uses CHECKIN_LIBRARY. */
 function checkinForCompletedDay(phaseId, day){
   const phase = PHASES[phaseId];
   if(phase.kind === 'pre'){
@@ -1558,13 +1576,16 @@ function checkinForCompletedDay(phaseId, day){
   }
   if(!mainPhaseId) return null;
   const weekWithinPhase = Math.floor((finalDay-phaseFirstDay)/7) + 1;
-  const content = checkinKey(mainPhaseId, weekWithinPhase);
-  if(!content) return null;
+  const defaultContent = checkinKey(mainPhaseId, weekWithinPhase);
+  const override = STATE.planImport && STATE.planImport.checkins && STATE.planImport.checkins[day];
+  if(!override && !defaultContent) return null;
   const totalWeeksInPhase = phaseWeekCount(mainPhaseId);
   const label = displayedLabel(mainPhaseId);
-  const title = totalWeeksInPhase>1 ? `${label} check-in \u2014 Week ${weekWithinPhase} of ${totalWeeksInPhase}` : `${label} check-in`;
+  const title = override ? override.title
+    : (totalWeeksInPhase>1 ? `${label} check-in \u2014 Week ${weekWithinPhase} of ${totalWeeksInPhase}` : `${label} check-in`);
+  const items = override ? override.items : defaultContent.items;
   const dueNote = `Record these tomorrow, on Day ${finalDay} \u2014 the final day of the week.`;
-  return { title, items: content.items, dueNote };
+  return { title, items, dueNote };
 }
 function phaseStartIndex(phaseId, allDays){
   const idx = allDays.findIndex(d=>d.phaseId===phaseId);
@@ -2566,7 +2587,7 @@ document.addEventListener('click', function(e){
         STATE.locationAssignments = {};
         LOCATIONS.forEach(loc=>{ STATE.locationAssignments[loc.id] = loc.name; });
         STATE.completedCount = computeAutoCompletedCount(STATE.startDate, STATE.handFeedingAlreadyDone, STATE.newtonsCradleAlreadyDone);
-        STATE.planImport = { v:5, days: plan.days||{} };
+        STATE.planImport = { v:5, days: plan.days||{}, checkins: plan.checkins||{} };
         STATE.onboarded = true;
         STATE.ui.planImportField = '';
         STATE.ui.view = 'locationSetup';
@@ -2718,9 +2739,10 @@ document.addEventListener('click', function(e){
       if(!raw){ toast('Paste a plan code first.'); break; }
       try{
         const plan = decodeAndValidatePlan(raw);
-        // Settings-screen updates only ever touch exercises/rules/locations —
-        // dog details and start date are set once, at initial import.
-        STATE.planImport = { v:5, days: plan.days||{} };
+        // Settings-screen updates only ever touch exercises/rules/locations/
+        // check-ins — dog details and start date are set once, at initial
+        // import, and progress (completedCount, extensions) is never touched.
+        STATE.planImport = { v:5, days: plan.days||{}, checkins: plan.checkins||{} };
         STATE.ui.planImportField = '';
         saveState();
         toast('Trainer plan applied.');
